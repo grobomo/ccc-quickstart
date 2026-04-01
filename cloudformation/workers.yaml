@@ -80,6 +80,7 @@ Resources:
             GITHUB_TOKEN=$(aws secretsmanager get-secret-value --secret-id ${FleetName}/github-token --query SecretString --output text --region ${AWS::Region} 2>/dev/null || echo "")
 
             # Build or pull worker image
+            mkdir -p /opt/ccc
             if [[ -n "$BUCKET" ]]; then
               aws s3 cp "s3://$BUCKET/docker/Dockerfile" /opt/ccc/Dockerfile --region ${AWS::Region} || true
               aws s3 cp "s3://$BUCKET/docker/entrypoint.sh" /opt/ccc/entrypoint.sh --region ${AWS::Region} || true
@@ -96,7 +97,7 @@ Resources:
               -e GITHUB_TOKEN="$GITHUB_TOKEN" \
               -e FLEET_NAME="${FleetName}" \
               -e AWS_REGION="${AWS::Region}" \
-              -e WORKER_ID="$(ec2-metadata -i | cut -d' ' -f2)" \
+              -e WORKER_ID="$(curl -s http://169.254.169.254/latest/meta-data/instance-id)" \
               ccc-worker:latest || true
 
             # Signal healthy

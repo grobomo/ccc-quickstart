@@ -21,11 +21,41 @@ Conditions:
   HasKeyName: !Not [!Equals [!Ref KeyName, '']]
 
 Resources:
+  ProxyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${FleetName}-proxy-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${FleetName}-proxy-discovery'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - autoscaling:DescribeAutoScalingGroups
+                  - ec2:DescribeInstances
+                Resource: '*'
+
+  ProxyInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${FleetName}-proxy-profile'
+      Roles:
+        - !Ref ProxyRole
+
   ProxyInstance:
     Type: AWS::EC2::Instance
     Properties:
       InstanceType: !Ref InstanceType
       ImageId: !Ref AmiId
+      IamInstanceProfile: !Ref ProxyInstanceProfile
       KeyName: !If [HasKeyName, !Ref KeyName, !Ref 'AWS::NoValue']
       SubnetId: !ImportValue
         Fn::Sub: '${FleetName}-PublicSubnetA'
