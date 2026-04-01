@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: !Sub '${FleetName} - Nginx Proxy & Dashboard'
+Description: CCC Fleet - Nginx Proxy & Dashboard
 
 Parameters:
   FleetName:

@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: !Sub '${FleetName} - S3 Storage & IAM Roles'
+Description: CCC Fleet - S3 Storage & IAM Roles
 
 Parameters:
   FleetName:
@@ -13,6 +13,7 @@ Resources:
   ArtifactsBucket:
     Type: AWS::S3::Bucket
     DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       BucketName: !Ref BucketName
       BucketEncryption:

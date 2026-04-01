@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: !Sub '${FleetName} - Worker EC2 Instances'
+Description: CCC Fleet - Worker EC2 Instances
 
 Parameters:
   FleetName:

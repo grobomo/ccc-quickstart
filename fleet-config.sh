@@ -70,6 +70,7 @@ _region_arg() {
 }
 
 _aws() {
+  # shellcheck disable=SC2046
   aws $(_profile_arg) $(_region_arg) "$@"
 }
 

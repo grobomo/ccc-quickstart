@@ -24,7 +24,7 @@ echo ""
 echo -e "${YELLOW}[!!]${NC} This will delete ALL resources for fleet: ${BOLD}$FLEET_NAME${NC}"
 echo -e "     Region: $AWS_REGION"
 echo ""
-read -p "Type the fleet name to confirm: " CONFIRM
+read -rp "Type the fleet name to confirm: " CONFIRM
 if [[ "$CONFIRM" != "$FLEET_NAME" ]]; then
   echo -e "${RED}[FAIL]${NC} Confirmation failed. Aborting."
   exit 1

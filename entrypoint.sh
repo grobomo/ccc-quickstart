@@ -29,11 +29,7 @@ if [[ -n "${GITHUB_TOKEN:-}" && -n "${GITHUB_REPO:-}" ]]; then
   fi
 fi
 
-TASKS_COMPLETED=0
-TASKS_RUNNING=0
-START_TIME=$(date +%s)
-
-# Simple HTTP server using bash + netcat fallback, or node
+# Simple HTTP server using node
 cat > /home/worker/server.js << 'SERVERJS'
 const http = require('http');
 const { execSync, spawn } = require('child_process');

@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: !Sub '${FleetName} - Network & Security Groups'
+Description: CCC Fleet - Network & Security Groups
 
 Parameters:
   FleetName:
