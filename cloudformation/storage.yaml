@@ -1,0 +1,103 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CCC Fleet - S3 Storage & IAM Roles
+
+Parameters:
+  FleetName:
+    Type: String
+    Description: Fleet name prefix for all resources
+  BucketName:
+    Type: String
+    Description: S3 bucket name for fleet artifacts
+
+Resources:
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldLogs
+            Status: Enabled
+            Prefix: logs/
+            ExpirationInDays: 30
+          - Id: CleanupOldTasks
+            Status: Enabled
+            Prefix: tasks/
+            ExpirationInDays: 90
+      Tags:
+        - Key: Fleet
+          Value: !Ref FleetName
+
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${FleetName}-worker-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: !Sub '${FleetName}-worker-s3'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ArtifactsBucket.Arn
+                  - !Sub '${ArtifactsBucket.Arn}/*'
+        - PolicyName: !Sub '${FleetName}-worker-secrets'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${FleetName}/*'
+      Tags:
+        - Key: Fleet
+          Value: !Ref FleetName
+
+  WorkerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${FleetName}-worker-profile'
+      Roles:
+        - !Ref WorkerRole
+
+Outputs:
+  BucketName:
+    Value: !Ref ArtifactsBucket
+    Export:
+      Name: !Sub '${FleetName}-BucketName'
+  BucketArn:
+    Value: !GetAtt ArtifactsBucket.Arn
+    Export:
+      Name: !Sub '${FleetName}-BucketArn'
+  WorkerInstanceProfile:
+    Value: !Ref WorkerInstanceProfile
+    Export:
+      Name: !Sub '${FleetName}-WorkerInstanceProfile'
+  WorkerInstanceProfileArn:
+    Value: !GetAtt WorkerInstanceProfile.Arn
+    Export:
+      Name: !Sub '${FleetName}-WorkerInstanceProfileArn'
+  WorkerRoleArn:
+    Value: !GetAtt WorkerRole.Arn
+    Export:
+      Name: !Sub '${FleetName}-WorkerRoleArn'

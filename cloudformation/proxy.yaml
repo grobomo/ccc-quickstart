@@ -1,0 +1,253 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CCC Fleet - Nginx Proxy & Dashboard
+
+Parameters:
+  FleetName:
+    Type: String
+    Description: Fleet name prefix
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    Description: EC2 instance type for proxy
+  KeyName:
+    Type: String
+    Default: ''
+    Description: SSH key pair name
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Conditions:
+  HasKeyName: !Not [!Equals [!Ref KeyName, '']]
+
+Resources:
+  ProxyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${FleetName}-proxy-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${FleetName}-proxy-discovery'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - autoscaling:DescribeAutoScalingGroups
+                  - ec2:DescribeInstances
+                Resource: '*'
+
+  ProxyInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${FleetName}-proxy-profile'
+      Roles:
+        - !Ref ProxyRole
+
+  ProxyInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref AmiId
+      IamInstanceProfile: !Ref ProxyInstanceProfile
+      KeyName: !If [HasKeyName, !Ref KeyName, !Ref 'AWS::NoValue']
+      SubnetId: !ImportValue
+        Fn::Sub: '${FleetName}-PublicSubnetA'
+      SecurityGroupIds:
+        - !ImportValue
+            Fn::Sub: '${FleetName}-ProxySG'
+      Tags:
+        - Key: Name
+          Value: !Sub '${FleetName}-proxy'
+        - Key: Fleet
+          Value: !Ref FleetName
+        - Key: Role
+          Value: proxy
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+
+          yum update -y
+          yum install -y nginx jq
+
+          # Discover worker IPs via ASG
+          ASG_NAME="${FleetName}-workers"
+          REGION="${AWS::Region}"
+
+          cat > /usr/local/bin/update-upstream.sh << 'SCRIPT'
+          #!/bin/bash
+          ASG_NAME="$1"
+          REGION="$2"
+
+          INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --query 'AutoScalingGroups[0].Instances[*].InstanceId' \
+            --output text --region "$REGION" 2>/dev/null)
+
+          if [[ -z "$INSTANCE_IDS" ]]; then
+            exit 0
+          fi
+
+          UPSTREAM=""
+          for ID in $INSTANCE_IDS; do
+            IP=$(aws ec2 describe-instances --instance-ids "$ID" \
+              --query 'Reservations[0].Instances[0].PrivateIpAddress' \
+              --output text --region "$REGION" 2>/dev/null)
+            if [[ -n "$IP" && "$IP" != "None" ]]; then
+              UPSTREAM="$UPSTREAM    server $IP:8080;\n"
+            fi
+          done
+
+          cat > /etc/nginx/conf.d/fleet.conf << EOF
+          upstream workers {
+          $(echo -e "$UPSTREAM")
+          }
+
+          server {
+              listen 80;
+              server_name _;
+
+              # Dashboard
+              location / {
+                  root /var/www/dashboard;
+                  index index.html;
+              }
+
+              # Fleet API - submit tasks
+              location /api/submit {
+                  proxy_pass http://workers;
+                  proxy_set_header Host \$host;
+                  proxy_set_header X-Real-IP \$remote_addr;
+                  proxy_read_timeout 300;
+              }
+
+              # Fleet API - task status
+              location /api/status {
+                  proxy_pass http://workers;
+                  proxy_set_header Host \$host;
+              }
+
+              # Fleet API - health
+              location /api/health {
+                  proxy_pass http://workers;
+                  proxy_set_header Host \$host;
+              }
+
+              # Worker direct access
+              location /api/workers/ {
+                  proxy_pass http://workers;
+                  proxy_set_header Host \$host;
+              }
+          }
+          EOF
+
+          nginx -t && systemctl reload nginx
+          SCRIPT
+          chmod +x /usr/local/bin/update-upstream.sh
+
+          # Create dashboard
+          mkdir -p /var/www/dashboard
+          cat > /var/www/dashboard/index.html << 'DASHBOARD'
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <title>${FleetName} Dashboard</title>
+            <meta charset="utf-8">
+            <style>
+              * { margin: 0; padding: 0; box-sizing: border-box; }
+              body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                     background: #0f172a; color: #e2e8f0; padding: 2rem; }
+              h1 { color: #38bdf8; margin-bottom: 1.5rem; }
+              .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 1rem; }
+              .card { background: #1e293b; border-radius: 8px; padding: 1.5rem; border: 1px solid #334155; }
+              .card h3 { color: #94a3b8; font-size: 0.875rem; text-transform: uppercase; margin-bottom: 0.5rem; }
+              .card .value { font-size: 2rem; font-weight: 700; }
+              .healthy { color: #4ade80; }
+              .unhealthy { color: #f87171; }
+              .pending { color: #fbbf24; }
+              table { width: 100%; border-collapse: collapse; margin-top: 1.5rem; }
+              th, td { padding: 0.75rem; text-align: left; border-bottom: 1px solid #334155; }
+              th { color: #94a3b8; font-size: 0.875rem; text-transform: uppercase; }
+              .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 0.5rem; }
+              .dot-green { background: #4ade80; }
+              .dot-red { background: #f87171; }
+              .dot-yellow { background: #fbbf24; }
+              #error { color: #f87171; padding: 1rem; display: none; }
+            </style>
+          </head>
+          <body>
+            <h1>${FleetName} Fleet Dashboard</h1>
+            <div class="grid" id="summary"></div>
+            <table id="workers-table">
+              <thead><tr><th>Worker</th><th>Status</th><th>Tasks</th><th>Uptime</th></tr></thead>
+              <tbody id="workers-body"></tbody>
+            </table>
+            <div id="error"></div>
+            <script>
+              async function refresh() {
+                try {
+                  const res = await fetch('/api/health');
+                  const data = await res.json();
+                  const healthy = data.workers?.filter(w => w.status === 'healthy').length || 0;
+                  const total = data.workers?.length || 0;
+                  document.getElementById('summary').innerHTML =
+                    '<div class="card"><h3>Workers</h3><div class="value">' + healthy + '/' + total + '</div></div>' +
+                    '<div class="card"><h3>Tasks Completed</h3><div class="value">' + (data.tasks_completed || 0) + '</div></div>' +
+                    '<div class="card"><h3>Tasks Queued</h3><div class="value">' + (data.tasks_queued || 0) + '</div></div>';
+                  const tbody = document.getElementById('workers-body');
+                  tbody.innerHTML = (data.workers || []).map(w =>
+                    '<tr><td>' + w.id + '</td>' +
+                    '<td><span class="status-dot dot-' + (w.status === 'healthy' ? 'green' : 'red') + '"></span>' + w.status + '</td>' +
+                    '<td>' + (w.tasks_completed || 0) + '</td>' +
+                    '<td>' + (w.uptime || 'N/A') + '</td></tr>'
+                  ).join('');
+                  document.getElementById('error').style.display = 'none';
+                } catch(e) {
+                  document.getElementById('error').textContent = 'Fleet unreachable: ' + e.message;
+                  document.getElementById('error').style.display = 'block';
+                }
+              }
+              refresh();
+              setInterval(refresh, 10000);
+            </script>
+          </body>
+          </html>
+          DASHBOARD
+
+          # Initial upstream config
+          /usr/local/bin/update-upstream.sh "$ASG_NAME" "$REGION"
+
+          # Cron to refresh upstream every minute
+          echo "* * * * * root /usr/local/bin/update-upstream.sh $ASG_NAME $REGION" > /etc/cron.d/fleet-upstream
+
+          systemctl enable nginx
+          systemctl start nginx
+
+  ProxyEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      InstanceId: !Ref ProxyInstance
+      Tags:
+        - Key: Name
+          Value: !Sub '${FleetName}-proxy-eip'
+
+Outputs:
+  ProxyPublicIp:
+    Value: !Ref ProxyEIP
+    Export:
+      Name: !Sub '${FleetName}-ProxyIP'
+  DashboardUrl:
+    Value: !Sub 'http://${ProxyEIP}'
+    Export:
+      Name: !Sub '${FleetName}-DashboardUrl'
+  ApiEndpoint:
+    Value: !Sub 'http://${ProxyEIP}/api'
+    Export:
+      Name: !Sub '${FleetName}-ApiEndpoint'
