@@ -2,15 +2,12 @@
 set -euo pipefail
 
 # =============================================================================
-# CCC Fleet Teardown - Clean Removal
-# =============================================================================
-# Usage: ./teardown.sh [--force] [--keep-bucket]
+# CCC Fleet Teardown - Clean removal of all resources
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/fleet-config.sh"
 
-# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -18,113 +15,69 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 BOLD='\033[1m'
 
-FORCE=false
-KEEP_BUCKET=false
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --force)       FORCE=true; shift ;;
-    --keep-bucket) KEEP_BUCKET=true; shift ;;
-    *)             shift ;;
-  esac
-done
-
-log()  { echo -e "  ${CYAN}>>>${NC} $*"; }
-ok()   { echo -e "  ${GREEN}[OK]${NC} $*"; }
-warn() { echo -e "  ${YELLOW}[!!]${NC} $*"; }
-fail() { echo -e "  ${RED}[FAIL]${NC} $*"; }
-
 echo ""
-echo -e "${RED}${BOLD}================================================================${NC}"
-echo -e "${RED}${BOLD}  CCC Fleet Teardown :: $FLEET_NAME${NC}"
-echo -e "${RED}${BOLD}================================================================${NC}"
-echo ""
-echo "  This will delete:"
-echo "    - CloudFormation stacks: network, storage, workers, proxy"
-echo "    - Secrets Manager entries: $FLEET_NAME/*"
-echo "    - SSM parameters: /$FLEET_NAME/*"
-if ! $KEEP_BUCKET; then
-  echo "    - S3 bucket: $S3_BUCKET (use --keep-bucket to preserve)"
-fi
+echo -e "${CYAN}${BOLD}  CCC Fleet Teardown :: $FLEET_NAME${NC}"
+echo -e "${CYAN}  $(printf '=%.0s' {1..50})${NC}"
 echo ""
 
-if ! $FORCE; then
-  read -rp "  Type the fleet name to confirm [$FLEET_NAME]: " CONFIRM
-  if [[ "$CONFIRM" != "$FLEET_NAME" ]]; then
-    echo ""
-    echo "  Aborted."
-    exit 1
-  fi
+# Confirm
+echo -e "${YELLOW}[!!]${NC} This will delete ALL resources for fleet: ${BOLD}$FLEET_NAME${NC}"
+echo -e "     Region: $AWS_REGION"
+echo ""
+read -p "Type the fleet name to confirm: " CONFIRM
+if [[ "$CONFIRM" != "$FLEET_NAME" ]]; then
+  echo -e "${RED}[FAIL]${NC} Confirmation failed. Aborting."
+  exit 1
 fi
 
 echo ""
 
-# ---------------------------------------------------------------------------
-# Delete stacks in reverse order
-# ---------------------------------------------------------------------------
 delete_stack() {
-  local name="$1"
+  local stack="$1"
   local status
-  status=$(_aws cloudformation describe-stacks --stack-name "$name" \
-    --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "DOES_NOT_EXIST")
+  status=$(_aws cloudformation describe-stacks --stack-name "$stack" \
+    --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "NOT_FOUND")
 
-  if [[ "$status" == "DOES_NOT_EXIST" ]]; then
-    ok "$name (already gone)"
+  if [[ "$status" == "NOT_FOUND" ]]; then
+    echo -e "  ${GREEN}[+]${NC} $stack: already gone"
     return 0
   fi
 
-  log "Deleting stack: $name ($status)"
-  _aws cloudformation delete-stack --stack-name "$name" --no-cli-pager 2>/dev/null || {
-    fail "Failed to initiate delete for $name"
+  echo -e "  ${YELLOW}[~]${NC} Deleting $stack..."
+  _aws cloudformation delete-stack --stack-name "$stack" --no-cli-pager 2>/dev/null
+  _aws cloudformation wait stack-delete-complete --stack-name "$stack" --no-cli-pager 2>/dev/null || {
+    echo -e "  ${RED}[X]${NC} $stack: delete failed (may need manual cleanup)"
     return 1
   }
-
-  log "Waiting for $name deletion..."
-  _aws cloudformation wait stack-delete-complete --stack-name "$name" --no-cli-pager 2>/dev/null || {
-    fail "$name deletion failed or timed out"
-    return 1
-  }
-
-  ok "$name deleted"
+  echo -e "  ${GREEN}[+]${NC} $stack: deleted"
 }
 
-# Reverse order: proxy -> workers -> storage -> network
-STACKS=(proxy workers storage network)
+# Delete in reverse order (proxy -> workers -> storage -> network)
+echo -e "${BOLD}Deleting stacks...${NC}"
+delete_stack "$(_stack_name proxy)"
+delete_stack "$(_stack_name workers)"
 
-for stack in "${STACKS[@]}"; do
-  delete_stack "$(_stack_name "$stack")"
-done
+# Delete secrets
+echo -e "${BOLD}Deleting secrets...${NC}"
+_aws secretsmanager delete-secret --secret-id "$FLEET_NAME/claude-api-key" --force-delete-without-recovery --no-cli-pager 2>/dev/null && \
+  echo -e "  ${GREEN}[+]${NC} claude-api-key deleted" || \
+  echo -e "  ${GREEN}[+]${NC} claude-api-key: already gone"
+_aws secretsmanager delete-secret --secret-id "$FLEET_NAME/github-token" --force-delete-without-recovery --no-cli-pager 2>/dev/null && \
+  echo -e "  ${GREEN}[+]${NC} github-token deleted" || \
+  echo -e "  ${GREEN}[+]${NC} github-token: already gone"
 
-# ---------------------------------------------------------------------------
-# Clean up S3 bucket (must empty before CFN can delete)
-# ---------------------------------------------------------------------------
-if ! $KEEP_BUCKET; then
-  log "Emptying S3 bucket: $S3_BUCKET"
-  _aws s3 rm "s3://$S3_BUCKET" --recursive --no-cli-pager 2>/dev/null || true
-  log "Deleting S3 bucket: $S3_BUCKET"
-  _aws s3 rb "s3://$S3_BUCKET" --no-cli-pager 2>/dev/null && ok "Bucket deleted" || warn "Bucket may already be gone"
-fi
+# Delete SSM parameter
+_aws ssm delete-parameter --name "/$FLEET_NAME/bucket" --no-cli-pager 2>/dev/null && \
+  echo -e "  ${GREEN}[+]${NC} SSM parameter deleted" || true
 
-# ---------------------------------------------------------------------------
-# Clean up secrets
-# ---------------------------------------------------------------------------
-log "Removing Secrets Manager entries..."
-for secret in claude-api-key github-token; do
-  _aws secretsmanager delete-secret \
-    --secret-id "$FLEET_NAME/$secret" \
-    --force-delete-without-recovery \
-    --no-cli-pager 2>/dev/null && ok "Secret $FLEET_NAME/$secret deleted" || true
-done
+# Storage stack (S3 bucket has DeletionPolicy: Retain)
+delete_stack "$(_stack_name storage)"
+echo -e "  ${YELLOW}[!!]${NC} S3 bucket ${BOLD}$S3_BUCKET${NC} retained (DeletionPolicy: Retain)"
+echo -e "      To delete: aws s3 rb s3://$S3_BUCKET --force $(_region_arg)"
 
-# ---------------------------------------------------------------------------
-# Clean up SSM parameters
-# ---------------------------------------------------------------------------
-log "Removing SSM parameters..."
-_aws ssm delete-parameter --name "/$FLEET_NAME/bucket" --no-cli-pager 2>/dev/null && ok "SSM /$FLEET_NAME/bucket deleted" || true
+# Network last
+delete_stack "$(_stack_name network)"
 
-# ---------------------------------------------------------------------------
-# Done
-# ---------------------------------------------------------------------------
 echo ""
-echo -e "  ${GREEN}${BOLD}Fleet $FLEET_NAME has been torn down.${NC}"
+echo -e "${GREEN}${BOLD}  Fleet $FLEET_NAME torn down.${NC}"
 echo ""

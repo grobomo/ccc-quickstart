@@ -1,4 +1,10 @@
-fleet-config.local.sh
+# Secrets - never commit
 *.env
-.env*
-continuous-claude.log
+fleet-config.local.sh
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
