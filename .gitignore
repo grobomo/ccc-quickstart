@@ -1,0 +1,4 @@
+fleet-config.local.sh
+*.env
+.env*
+continuous-claude.log

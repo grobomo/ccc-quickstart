@@ -1,0 +1,145 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: !Sub '${FleetName} - Worker EC2 Instances'
+
+Parameters:
+  FleetName:
+    Type: String
+    Description: Fleet name prefix
+  WorkerCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 20
+    Description: Number of worker instances
+  InstanceType:
+    Type: String
+    Default: m5.xlarge
+    Description: EC2 instance type for workers
+  UseSpot:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Use spot instances
+  SpotMaxPrice:
+    Type: String
+    Default: ''
+    Description: Max spot price (blank = on-demand cap)
+  KeyName:
+    Type: String
+    Description: SSH key pair name
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: AMI ID (defaults to latest Amazon Linux 2023)
+
+Conditions:
+  IsSpot: !Equals [!Ref UseSpot, 'true']
+  HasSpotPrice: !Not [!Equals [!Ref SpotMaxPrice, '']]
+  HasKeyName: !Not [!Equals [!Ref KeyName, '']]
+
+Resources:
+  WorkerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${FleetName}-worker-lt'
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Name: !ImportValue
+            Fn::Sub: '${FleetName}-WorkerInstanceProfile'
+        KeyName: !If [HasKeyName, !Ref KeyName, !Ref 'AWS::NoValue']
+        SecurityGroupIds:
+          - !ImportValue
+              Fn::Sub: '${FleetName}-WorkerSG'
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${FleetName}-worker'
+              - Key: Fleet
+                Value: !Ref FleetName
+              - Key: Role
+                Value: worker
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euo pipefail
+
+            # Install Docker
+            yum update -y
+            yum install -y docker git jq
+            systemctl enable docker
+            systemctl start docker
+
+            # Pull fleet config from S3
+            BUCKET=$(aws ssm get-parameter --name "/${FleetName}/bucket" --query Parameter.Value --output text --region ${AWS::Region} 2>/dev/null || echo "")
+
+            # Get secrets
+            CLAUDE_KEY=$(aws secretsmanager get-secret-value --secret-id ${FleetName}/claude-api-key --query SecretString --output text --region ${AWS::Region} 2>/dev/null || echo "")
+            GITHUB_TOKEN=$(aws secretsmanager get-secret-value --secret-id ${FleetName}/github-token --query SecretString --output text --region ${AWS::Region} 2>/dev/null || echo "")
+
+            # Build or pull worker image
+            if [[ -n "$BUCKET" ]]; then
+              aws s3 cp "s3://$BUCKET/docker/Dockerfile" /opt/ccc/Dockerfile --region ${AWS::Region} || true
+              aws s3 cp "s3://$BUCKET/docker/entrypoint.sh" /opt/ccc/entrypoint.sh --region ${AWS::Region} || true
+              chmod +x /opt/ccc/entrypoint.sh 2>/dev/null || true
+              cd /opt/ccc && docker build -t ccc-worker:latest . 2>/dev/null || true
+            fi
+
+            # Run worker container
+            docker run -d \
+              --name ccc-worker \
+              --restart unless-stopped \
+              -p 8080:8080 \
+              -e ANTHROPIC_API_KEY="$CLAUDE_KEY" \
+              -e GITHUB_TOKEN="$GITHUB_TOKEN" \
+              -e FLEET_NAME="${FleetName}" \
+              -e AWS_REGION="${AWS::Region}" \
+              -e WORKER_ID="$(ec2-metadata -i | cut -d' ' -f2)" \
+              ccc-worker:latest || true
+
+            # Signal healthy
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource WorkerASG --region ${AWS::Region} || true
+
+  WorkerASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${FleetName}-workers'
+      MinSize: !Ref WorkerCount
+      MaxSize: !Ref WorkerCount
+      DesiredCapacity: !Ref WorkerCount
+      VPCZoneIdentifier:
+        - !ImportValue
+            Fn::Sub: '${FleetName}-PublicSubnetA'
+        - !ImportValue
+            Fn::Sub: '${FleetName}-PublicSubnetB'
+      MixedInstancesPolicy:
+        InstancesDistribution:
+          OnDemandPercentageAboveBaseCapacity: !If [IsSpot, 0, 100]
+          SpotMaxPrice: !If [HasSpotPrice, !Ref SpotMaxPrice, !Ref 'AWS::NoValue']
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref WorkerLaunchTemplate
+            Version: !GetAtt WorkerLaunchTemplate.LatestVersionNumber
+      Tags:
+        - Key: Name
+          Value: !Sub '${FleetName}-worker'
+          PropagateAtLaunch: true
+        - Key: Fleet
+          Value: !Ref FleetName
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref WorkerCount
+        Timeout: PT15M
+
+Outputs:
+  AutoScalingGroup:
+    Value: !Ref WorkerASG
+    Export:
+      Name: !Sub '${FleetName}-WorkerASG'
+  LaunchTemplate:
+    Value: !Ref WorkerLaunchTemplate
+    Export:
+      Name: !Sub '${FleetName}-WorkerLT'
